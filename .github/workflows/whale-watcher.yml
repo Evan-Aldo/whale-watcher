@@ -1,0 +1,47 @@
+name: whale-watcher
+
+# Runs the bot on a schedule (free on public repos). Note: GitHub's minimum is
+# every 5 minutes, and scheduled runs are often delayed 5-20+ min under load.
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # every 5 minutes (UTC)
+  workflow_dispatch:            # lets you run it manually from the Actions tab
+
+# Never let two runs overlap and race the saved state.
+concurrency:
+  group: whale-watcher
+  cancel-in-progress: false
+
+permissions:
+  contents: write               # allows committing the dedup state back to the repo
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Poll for whale trades
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_ONCE: "true"
+          LOOKBACK_MIN: "30"       # scan a 30-min window each run (dedup prevents repeats)
+          # ---- optional overrides (or set these as repo Variables/Secrets) ----
+          # POLY_WHALE_USD: "10000"
+          # KALSHI_WHALE_USD: "5000"
+          # MEGA_MENTION: "<@&YOUR_ROLE_ID>"
+        run: python prediction_whale_bot.py
+
+      - name: Save what was posted (so it isn't reposted next run)
+        run: |
+          git config user.name  "whale-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add whale_state.json || true
+          git commit -m "update whale state [skip ci]" || echo "no state change"
+          git push || echo "nothing to push"
