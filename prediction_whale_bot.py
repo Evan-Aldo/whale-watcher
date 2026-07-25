@@ -61,6 +61,16 @@ MAX_PRICE_CENTS = float(os.getenv("MAX_PRICE_CENTS", "95"))
 KALSHI_EXCLUDE_TICKERS = [s.strip().upper() for s in
                           os.getenv("KALSHI_EXCLUDE_TICKERS", "").split(",") if s.strip()]
 
+# Category filtering (applies to both platforms). By default sports is excluded,
+# since it dominates both venues and isn't the macro/crypto/political signal you
+# likely care about. Matching is case-insensitive substring against each market's
+# category/tags. To instead allow ONLY certain categories, set ONLY_CATEGORIES
+# (e.g. "crypto,economics,politics") -- it takes precedence over EXCLUDE.
+EXCLUDE_CATEGORIES = [s.strip().lower() for s in
+                      os.getenv("EXCLUDE_CATEGORIES", "sports").split(",") if s.strip()]
+ONLY_CATEGORIES = [s.strip().lower() for s in
+                   os.getenv("ONLY_CATEGORIES", "").split(",") if s.strip()]
+
 # Run mode
 RUN_ONCE     = os.getenv("RUN_ONCE", "false").lower() == "true"   # one poll then exit (for cron)
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))               # always-on cadence
@@ -88,8 +98,42 @@ SESSION.headers.update({"User-Agent": "prediction-whale-bot/2.1"})
 
 COLOR_POLY, COLOR_KALSHI, COLOR_MEGA = 0x1652F0, 0x00B894, 0xF1C40F  # blue / teal / gold
 MAX_SEEN = 6000
-_kalshi_title_cache = {}  # ticker -> (label, event_ticker)
-_kalshi_event_cache = {}  # event_ticker -> clean event title
+_kalshi_title_cache = {}       # ticker -> (label, event_ticker, category)
+_kalshi_event_cache = {}       # event_ticker -> (title, category)
+_kalshi_series_cat_cache = {}  # series_ticker -> category
+_poly_cat_cache = {}           # event_slug -> lowercased tag blob
+
+
+def category_ok(blob):
+    """blob = lowercased category text for a market ('' if unknown)."""
+    blob = (blob or "").lower()
+    if ONLY_CATEGORIES:                      # whitelist mode: must positively match
+        return bool(blob) and any(tok in blob for tok in ONLY_CATEGORIES)
+    return not (blob and any(tok in blob for tok in EXCLUDE_CATEGORIES))
+
+
+def poly_categories(event_slug):
+    """Lowercased blob of a Polymarket event's tag labels/slugs, cached."""
+    if not event_slug:
+        return ""
+    if event_slug in _poly_cat_cache:
+        return _poly_cat_cache[event_slug]
+    blob = ""
+    try:
+        r = SESSION.get("https://gamma-api.polymarket.com/events",
+                        params={"slug": event_slug}, timeout=15)
+        if r.ok:
+            data = r.json()
+            ev = (data[0] if isinstance(data, list) and data
+                  else data if isinstance(data, dict) else {}) or {}
+            parts = []
+            for tg in (ev.get("tags") or []):
+                parts += [str(tg.get("label", "")).lower(), str(tg.get("slug", "")).lower()]
+            blob = " ".join(p for p in parts if p)
+    except requests.RequestException:
+        pass
+    _poly_cat_cache[event_slug] = blob
+    return blob
 
 
 def log(msg):
@@ -148,6 +192,8 @@ def fetch_polymarket_whales(since_ts):
             if not (MIN_PRICE_CENTS <= price * 100 <= MAX_PRICE_CENTS):
                 continue
             event_slug = t.get("eventSlug") or t.get("slug") or ""
+            if not category_ok(poly_categories(event_slug)):
+                continue
             wallet = t.get("proxyWallet", "")
             tx = t.get("transactionHash", "")
             out.append({
@@ -176,43 +222,66 @@ def fetch_polymarket_whales(since_ts):
 
 
 # ---- Kalshi -----------------------------------------------------------------
-def _kalshi_event_title(event_ticker):
+def _kalshi_series_category(series_ticker):
+    if not series_ticker:
+        return ""
+    if series_ticker in _kalshi_series_cat_cache:
+        return _kalshi_series_cat_cache[series_ticker]
+    cat = ""
+    try:
+        r = SESSION.get(f"{KALSHI_BASE}/series/{series_ticker}", timeout=15)
+        if r.ok:
+            cat = ((r.json().get("series", {}) or {}).get("category") or "").lower()
+    except requests.RequestException:
+        pass
+    _kalshi_series_cat_cache[series_ticker] = cat
+    return cat
+
+
+def _kalshi_event_info(event_ticker):
+    """(clean event title, lowercased category), cached."""
     if not event_ticker:
-        return None
+        return None, ""
     if event_ticker in _kalshi_event_cache:
         return _kalshi_event_cache[event_ticker]
-    title = None
+    title, cat, series = None, "", None
     try:
         r = SESSION.get(f"{KALSHI_BASE}/events/{event_ticker}", timeout=15)
         if r.ok:
-            title = (r.json().get("event", {}) or {}).get("title")
+            ev = r.json().get("event", {}) or {}
+            title = ev.get("title")
+            cat = (ev.get("category") or "").lower()
+            series = ev.get("series_ticker")
     except requests.RequestException:
         pass
-    _kalshi_event_cache[event_ticker] = title
-    return title
+    if not cat:
+        cat = _kalshi_series_category(series)
+    _kalshi_event_cache[event_ticker] = (title, cat)
+    return title, cat
 
 
 def kalshi_label(ticker):
-    """ticker -> (clean label, event_ticker), cached.
+    """ticker -> (clean label, event_ticker, category), cached.
 
     Prefers the event's question plus the market's strike subtitle, which is far
     cleaner than the per-market title on strike-based markets (crypto, temps, etc).
     """
     if ticker in _kalshi_title_cache:
         return _kalshi_title_cache[ticker]
-    label, event_ticker = ticker, None
+    label, event_ticker, cat = ticker, None, ""
     try:
         r = SESSION.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=15)
         if r.ok:
             m = r.json().get("market", {}) or {}
             event_ticker = m.get("event_ticker")
             sub = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
-            base = (_kalshi_event_title(event_ticker) or m.get("title") or ticker).strip()
+            etitle, cat = _kalshi_event_info(event_ticker)
+            base = (etitle or m.get("title") or ticker).strip()
             label = base if (not sub or sub.lower() in base.lower()) else f"{base} \u2014 {sub}"
     except requests.RequestException:
         pass
-    _kalshi_title_cache[ticker] = (label, event_ticker)
-    return label, event_ticker
+    _kalshi_title_cache[ticker] = (label, event_ticker, cat)
+    return label, event_ticker, cat
 
 
 def _kalshi_count(t):
@@ -277,7 +346,9 @@ def fetch_kalshi_whales(since_ts):
         if usd < KALSHI_WHALE_USD and not (KALSHI_BLOCK_ALWAYS and is_block):
             continue
 
-        title, event_ticker = kalshi_label(ticker)
+        title, event_ticker, category = kalshi_label(ticker)
+        if not category_ok(category):
+            continue
         url = f"https://kalshi.com/markets/{event_ticker}" if event_ticker else \
               (f"https://kalshi.com/markets/{ticker}" if ticker else "https://kalshi.com")
         out.append({
