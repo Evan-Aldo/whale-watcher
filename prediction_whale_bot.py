@@ -49,6 +49,18 @@ KALSHI_BIG_USD   = float(os.getenv("KALSHI_BIG_USD", "25000"))
 # Alert on every Kalshi block trade even if it's under KALSHI_WHALE_USD.
 KALSHI_BLOCK_ALWAYS = os.getenv("KALSHI_BLOCK_ALWAYS", "true").lower() == "true"
 
+# Skip near-certain trades -- buying at ~99c is parking cash for yield, not a
+# conviction bet. Prices are in cents; default alerts only between 5c and 95c.
+# Applies to BOTH platforms (and to block trades).
+MIN_PRICE_CENTS = float(os.getenv("MIN_PRICE_CENTS", "5"))
+MAX_PRICE_CENTS = float(os.getenv("MAX_PRICE_CENTS", "95"))
+
+# Optional: mute Kalshi markets whose ticker contains any of these substrings
+# (comma-separated), e.g. "KXBTC,KXETH" to drop crypto scalp markets. The ticker
+# prefix (before the first dash) is the series -- you'll see it in the logs.
+KALSHI_EXCLUDE_TICKERS = [s.strip().upper() for s in
+                          os.getenv("KALSHI_EXCLUDE_TICKERS", "").split(",") if s.strip()]
+
 # Run mode
 RUN_ONCE     = os.getenv("RUN_ONCE", "false").lower() == "true"   # one poll then exit (for cron)
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))               # always-on cadence
@@ -76,7 +88,8 @@ SESSION.headers.update({"User-Agent": "prediction-whale-bot/2.1"})
 
 COLOR_POLY, COLOR_KALSHI, COLOR_MEGA = 0x1652F0, 0x00B894, 0xF1C40F  # blue / teal / gold
 MAX_SEEN = 6000
-_kalshi_title_cache = {}  # ticker -> (title, event_ticker)
+_kalshi_title_cache = {}  # ticker -> (label, event_ticker)
+_kalshi_event_cache = {}  # event_ticker -> clean event title
 
 
 def log(msg):
@@ -132,6 +145,8 @@ def fetch_polymarket_whales(since_ts):
             usd = size * price
             if usd < POLY_WHALE_USD:
                 continue
+            if not (MIN_PRICE_CENTS <= price * 100 <= MAX_PRICE_CENTS):
+                continue
             event_slug = t.get("eventSlug") or t.get("slug") or ""
             wallet = t.get("proxyWallet", "")
             tx = t.get("transactionHash", "")
@@ -161,21 +176,43 @@ def fetch_polymarket_whales(since_ts):
 
 
 # ---- Kalshi -----------------------------------------------------------------
-def kalshi_title(ticker):
-    """ticker -> (human title, event_ticker), cached. Falls back to the ticker."""
+def _kalshi_event_title(event_ticker):
+    if not event_ticker:
+        return None
+    if event_ticker in _kalshi_event_cache:
+        return _kalshi_event_cache[event_ticker]
+    title = None
+    try:
+        r = SESSION.get(f"{KALSHI_BASE}/events/{event_ticker}", timeout=15)
+        if r.ok:
+            title = (r.json().get("event", {}) or {}).get("title")
+    except requests.RequestException:
+        pass
+    _kalshi_event_cache[event_ticker] = title
+    return title
+
+
+def kalshi_label(ticker):
+    """ticker -> (clean label, event_ticker), cached.
+
+    Prefers the event's question plus the market's strike subtitle, which is far
+    cleaner than the per-market title on strike-based markets (crypto, temps, etc).
+    """
     if ticker in _kalshi_title_cache:
         return _kalshi_title_cache[ticker]
-    title, event_ticker = ticker, None
+    label, event_ticker = ticker, None
     try:
         r = SESSION.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=15)
         if r.ok:
             m = r.json().get("market", {}) or {}
-            title = m.get("title") or m.get("subtitle") or ticker
             event_ticker = m.get("event_ticker")
+            sub = (m.get("yes_sub_title") or m.get("subtitle") or "").strip()
+            base = (_kalshi_event_title(event_ticker) or m.get("title") or ticker).strip()
+            label = base if (not sub or sub.lower() in base.lower()) else f"{base} \u2014 {sub}"
     except requests.RequestException:
         pass
-    _kalshi_title_cache[ticker] = (title, event_ticker)
-    return title, event_ticker
+    _kalshi_title_cache[ticker] = (label, event_ticker)
+    return label, event_ticker
 
 
 def _kalshi_count(t):
@@ -232,11 +269,15 @@ def fetch_kalshi_whales(since_ts):
             side, price_paid = None, yes
         usd = count * price_paid
         is_block = bool(t.get("is_block_trade"))
+        ticker = t.get("ticker", "")
+        if any(x in ticker.upper() for x in KALSHI_EXCLUDE_TICKERS):
+            continue
+        if not (MIN_PRICE_CENTS <= price_paid * 100 <= MAX_PRICE_CENTS):
+            continue
         if usd < KALSHI_WHALE_USD and not (KALSHI_BLOCK_ALWAYS and is_block):
             continue
 
-        ticker = t.get("ticker", "")
-        title, event_ticker = kalshi_title(ticker)
+        title, event_ticker = kalshi_label(ticker)
         url = f"https://kalshi.com/markets/{event_ticker}" if event_ticker else \
               (f"https://kalshi.com/markets/{ticker}" if ticker else "https://kalshi.com")
         out.append({
