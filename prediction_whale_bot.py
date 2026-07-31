@@ -41,10 +41,10 @@ ENABLE_KALSHI     = os.getenv("ENABLE_KALSHI", "true").lower() == "true"
 
 # Per-platform thresholds. Kalshi fills run thinner than Polymarket's biggest
 # markets, so its bar is lower by default.
-POLY_WHALE_USD   = float(os.getenv("POLY_WHALE_USD", "10000"))
+POLY_WHALE_USD   = float(os.getenv("POLY_WHALE_USD", "20000"))
 POLY_BIG_USD     = float(os.getenv("POLY_BIG_USD", "50000"))   # "mega" -> gold + optional ping
-KALSHI_WHALE_USD = float(os.getenv("KALSHI_WHALE_USD", "5000"))
-KALSHI_BIG_USD   = float(os.getenv("KALSHI_BIG_USD", "25000"))
+KALSHI_WHALE_USD = float(os.getenv("KALSHI_WHALE_USD", "15000"))
+KALSHI_BIG_USD   = float(os.getenv("KALSHI_BIG_USD", "30000"))
 
 # Alert on every Kalshi block trade even if it's under KALSHI_WHALE_USD.
 KALSHI_BLOCK_ALWAYS = os.getenv("KALSHI_BLOCK_ALWAYS", "true").lower() == "true"
